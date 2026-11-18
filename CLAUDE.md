@@ -129,9 +129,14 @@ model endpoint. CERN-specific facts live in `docs/cern-infrastructure.md`.
   score components (bm25, vector, rrf, rerank) so they can be debugged. Plus the
   minimal auth endpoints: `/me`, personal tokens, grants, and one static page for them.
 - **MCP server.** A thin wrapper over the same core, with the same access checks (token
-  from the request over HTTP, from the environment over stdio). Tools: `search`,
-  `get_document`, `get_chunk`. Tool descriptions tell agents to write separate lex and
-  vec queries.
+  from the request over HTTP; stdio is a client of the HTTP service). Supports finding
+  and agentic reading: `list_collections`, `search`, `list_documents`, `outline`,
+  `get_document` (bounded line, section or page ranges with a `next` selector),
+  `get_chunk` (with neighbours), and documents as resources. Where the principal and
+  token have `write`, also `put_document`, `patch_section` and `delete_document`, with a
+  version check and recorded provenance. No special collection kinds: roles decide. Server
+  instructions tell agents to read outlines first, write separate lex and vec queries,
+  and cite with doc id plus lines, section or pages. Spec: `docs/spec.md` section 4.
 - **Ingest CLI.** An API client: chunks with the shared chunker, embeds locally when a
   GPU is present, and posts batches with vectors; otherwise posts text and the server
   embeds. Idempotent and keyed on content hash. Needs `write` on the target
@@ -173,8 +178,9 @@ model endpoint. CERN-specific facts live in `docs/cern-infrastructure.md`.
 ## Docs and skills
 
 - `docs/spec.md` — the design spec. Sections 1 (collections and access control),
-  2 (lexical normaliser) and 3 (indexes) are written; the other sections come before
-  their components.
+  2 (lexical normaliser), 3 (indexes), 4 (MCP server) and 5 (document elements, a
+  placeholder for figures, tables and equations) are written; the other sections come
+  before their components.
 - `docs/cern-infrastructure.md` — verified facts about DBOD, the AI gateway and
   ml.cern.ch, with dates. Update it when re-checked.
 - `docs/prior-art.md` — what qmd and its relatives actually do.

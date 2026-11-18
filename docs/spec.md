@@ -1,8 +1,9 @@
 # pg-retrieve specification
 
 Status: in progress. Sections written so far: collections and access control (1), the
-lexical normaliser (2), indexes (3). Still to write: data model for documents and chunks,
-ingest, search pipeline, HTTP API, MCP, configuration. Each component gets its section
+lexical normaliser (2), indexes (3), MCP server (4), document elements (5, a
+placeholder). Still to write: data model for documents and chunks, ingest, search
+pipeline, HTTP API, configuration. Each component gets its section
 here before implementation.
 
 ## 1. Collections and access control
@@ -38,7 +39,8 @@ here before implementation.
 - **Role.** One of `read`, `write`, `admin`, ordered: `admin` implies `write` implies
   `read`.
   - `read`: search, get_chunk, get_document, list the collection.
-  - `write`: ingest and update documents, delete single documents.
+  - `write`: ingest, create, update and delete documents, through the HTTP API, the
+    CLI or MCP alike.
   - `admin`: grant and revoke rights, create, fill, switch and delete indexes, delete
     the collection.
 - **Service administrator.** A principal or group named in config (`auth.admins`). Can
@@ -423,3 +425,268 @@ interface.
 - Re-embedding is a new index plus a default switch, replacing the staging table of an
   earlier draft of section 1.6.
 - Query expansion and reranking stay per-request switches outside the index.
+
+## 4. MCP server
+
+### 4.1 Purpose and scope
+
+The MCP server lets agents find, read and, where they have the right, write documents.
+Finding is `search`. Reading is a first-class use: an agent gets an outline of a document, then reads it section by
+section, and cites what it read. This is the workflow the DELPHI agents already use with
+qmd (wiki page with a table of contents and line ranges, then `get` with a line range).
+Documents average 68 k characters and theses run to hundreds of chunks, so every read is
+bounded.
+
+The server is a thin layer over the library core, with the same access checks as the
+HTTP API (section 1.5). What an agent may do on a collection follows only from its
+principal's roles, through users and groups, and from its token's ceiling: `read` allows
+the reading tools, `write` adds the document tools of 4.5. There are no special
+collection kinds. Bulk ingest, index lifecycle and grants stay on the HTTP API and the
+CLI, never on MCP.
+
+### 4.2 Transports and authentication
+
+- **Streamable HTTP**, mounted in the service at `/mcp`. The bearer token from the
+  request identifies the principal. `Origin` and `Host` are validated against config, as
+  qmd does against DNS rebinding.
+- **stdio**, started as `pg-retrieve mcp`, for local agent harnesses. It talks to a
+  remote service over HTTP with the token from `PG_RETRIEVE_TOKEN` and the URL from
+  `PG_RETRIEVE_URL`. It never opens the database itself.
+
+A token minted with a role ceiling and collection pattern (section 1.3) is the normal
+way to give an agent access: for example read-only on `delphi/*`, expiring. An agent that
+should write gets a token whose ceiling is `write`, ideally on a narrower pattern than
+its read access. This is also the main defence against prompt injection from documents
+the agent reads: an agent can only damage what its token can write.
+
+### 4.3 Server instructions
+
+The MCP `instructions` field carries the reading workflow, so every client gets it
+without a project file:
+
+- Start with `search` or `list_documents`; treat hits and snippets as leads, not facts.
+- Call `outline` before reading a long document; read sections or line ranges with
+  `get_document`, not whole documents.
+- Write separate `lex` (keywords, exact terms, symbols) and `vec` (a natural-language
+  sentence) queries; use `query` only for a plain question.
+- Cite as `[[<doc_id>]]` with section, lines or pages, exactly as returned.
+- When writing, read the document's `version` first and pass it back; state the sources
+  a written document relies on in its `sources` field.
+
+The text is generic. Per-deployment additions (for DELPHI: the collection descriptions,
+id formats, the preference for journal versions) come from config, so the DELPHI
+specifics never sit in code.
+
+### 4.4 Tools
+
+All tools take only collections the principal can read; others behave as nonexistent.
+Every response that contains document text carries the citation fields of 4.6.
+
+**`list_collections`** — the readable collections with description, document count,
+default index, the other indexes and their status, and the filterable metadata fields
+with example values (qmd's `metadata` discovery). No parameters.
+
+**`search`**
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `query` | string | a plain question; expanded by the configured backend unless `lex` or `vec` is given |
+| `lex` | list of strings | lexical queries, no expansion |
+| `vec` | list of strings | vector queries, no expansion |
+| `hyde` | string | optional hypothetical passage for the vector leg |
+| `collections` | list | names or prefixes (`delphi/*`); default all readable |
+| `filters` | object | metadata filters: `year`, `kind`, `language`, `topics`, `detectors`, ... (field list from `list_collections`) |
+| `index` | string | named index; omit for the default (section 3.3) |
+| `mode` | enum | `lex`, `vec`, `hybrid` (default) |
+| `rerank` | bool | default from config |
+| `limit` | int | default 10, max 50 |
+
+At least one of `query`, `lex`, `vec` is required. Each hit returns the chunk id, document
+id, title, collection, heading path, line range, page range, a snippet, and the score
+components (`bm25`, `vector`, `rrf`, `rerank`). The response names the index used and
+whether expansion and reranking ran.
+
+**`list_documents`** — browse without a query. Parameters `collections`, `filters`,
+`sort` (`year`, `title`), `limit`, `cursor`. Returns id, title, year, kind, language,
+one-line summary when a card exists.
+
+**`outline`** — the entry point for reading. Parameter `doc_id`, optional `index`.
+Returns:
+
+- the frontmatter metadata and the card summary when present;
+- the heading tree, each node with its number when the document has one, title, level,
+  line range, page range, character count, and the chunk ids it spans in the chosen index;
+- total lines, characters and pages.
+
+The heading tree is computed at ingest by the same heading pass the chunker uses, so
+section boundaries in the outline and chunk provenance agree.
+
+**`get_document`** — bounded reads of the Markdown. Parameter `doc_id` plus at most one
+range selector:
+
+| Selector | Example | Meaning |
+|---|---|---|
+| `lines` | `{"from": 220, "count": 80}` | a line range |
+| `section` | `"4.2"` or `["Results", "Systematic errors"]` | a section by number or heading path, with its subsections |
+| `pages` | `{"from": 12, "to": 13}` | the text on those PDF pages (once page markers exist; error otherwise) |
+
+Without a selector, the whole document is returned if it is below the cap. Every read is
+capped at `mcp.max_chars` (default 12,000). A truncated read ends at a line boundary and
+returns `next` (the selector for the following range), so an agent can continue without
+arithmetic. Lines are returned with their line numbers, so a citation can point inside
+the range.
+
+**`get_chunk`** — one chunk by id, with its text, provenance, and the ids of the previous
+and next chunk in the same index, so an agent can read around a search hit.
+
+### 4.5 Document tools
+
+Listed in `tools/list` only when the principal, within its token's ceiling, has `write` on
+at least one collection; otherwise the server is read-only for that session. Each call
+checks `write` on the target collection.
+
+**`put_document`** — create or replace one document.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `collection` | string | target collection |
+| `doc_id` | string | optional on create (the server assigns one); required on replace |
+| `markdown` | string | the full document, optionally with YAML frontmatter |
+| `metadata` | object | optional; merged over the frontmatter |
+| `sources` | list | optional ids of documents this one relies on; the server checks they exist and are readable by the caller |
+| `version` | string | required on replace: the version the caller last read; a mismatch fails |
+
+**`patch_section`** — replace one section, by number or heading path, with new Markdown
+including its heading. Same `version` check. Fits page-by-page work on long documents.
+
+**`delete_document`** — remove one document, with the `version` check.
+
+Behaviour:
+
+- Every write produces a new `version` (a content hash), returned to the caller. A stale
+  `version` fails with the current one, so concurrent agents cannot silently overwrite
+  each other.
+- The document is lexically searchable when the call returns, in every index of the
+  collection. Vectors are computed in the background by the server's `openai` embedding
+  backend for each index whose model it can reach (section 1.6, the path without a GPU).
+  An index whose model is only available to the bulk worker marks the document as
+  pending until the worker fills it. `outline` reports per index whether vectors are
+  complete.
+- Size and rate limits apply per token (`mcp.max_write_chars`, `mcp.writes_per_minute`),
+  to keep gateway load bounded.
+- Every write is in the audit log (section 1.8).
+
+### 4.6 Resources
+
+Each readable document is also an MCP resource, for clients that attach documents rather
+than call tools:
+
+- URI `pg-retrieve://<collection>/<doc_id>`, for example
+  `pg-retrieve://delphi/notes/delphi-1995-012-phys-487`.
+- Resource templates with the selectors of `get_document`:
+  `...?lines=220-299`, `...?section=4.2`, `...?pages=12-13`, under the same cap.
+- `resources/list` is paginated and limited to readable collections. Subscriptions are
+  not supported; the corpus changes by ingest, not live.
+
+### 4.7 Citation and provenance fields
+
+Every piece of returned text carries `collection`, `doc_id`, `title`, `version`, `lines`
+(first and last line number), `pages` (first and last page, or `null` when unknown, never
+guessed), `heading_path`, and, for chunks, `chunk_id` and `index`. `outline` also returns
+the provenance of the document: how it arrived (ingest or API write), created and updated
+by which principal and token label, when, and its declared `sources`. Search hits carry
+the same provenance in short form, so a reader can tell a written note from an ingested
+paper without the service knowing which is which. Line numbers count lines of the
+stored Markdown file including its frontmatter, as qmd's `get` does, so line citations
+already in the DELPHI wiki remain valid.
+
+### 4.8 Limits and errors
+
+- Per-call caps: `limit` on search and listing, `max_chars` on reads, `max_write_chars`
+  on writes. Rate limiting per principal is configurable, off by default for reads and on
+  for writes.
+- A document or collection the principal cannot read returns the same error as one that
+  does not exist.
+- A named index that is not `ready`, a `pages` selector without page data, or a section
+  that does not exist return an error that says what is available (the ready indexes,
+  the outline's section numbers).
+- Expansion or rerank failures do not fail the call; the response says the stage was
+  skipped, as in section 5 of the retrieval design.
+
+### 4.9 Decisions taken
+
+- MCP reads and writes single documents; roles from users and groups, capped by the
+  token, decide which (decided 2026-11-17, replacing an earlier read-only draft). There
+  are no collection kinds such as source or derived: the service stays generic, and a
+  deployment expresses such distinctions through collections and grants.
+- Bulk ingest, index lifecycle and grants are not exposed over MCP.
+- Writes use optimistic concurrency with a version hash.
+- Reading is bounded by a character cap with an explicit `next` selector, rather than
+  trusting agents to request sensible ranges.
+- Line numbers include the frontmatter, for compatibility with qmd and the DELPHI wiki.
+- The stdio server is a client of the HTTP service, so there is one place that holds
+  database credentials.
+
+## 5. Document elements (placeholder)
+
+### 5.1 Purpose
+
+Figures, tables and equations need their own place in the data model now, so that
+captions, generated descriptions and images can be added later without a schema change.
+Making them useful for search is future work. This section only fixes where they live
+and what the chunker does with them by default.
+
+Measured on the DELPHI corpus (2026-11-18):
+
+| Element | Count | Share of text | Notes |
+|---|---|---|---|
+| figures | 52,737 image references in 3,191 documents | none (links only) | captions are text next to the image; Docling JSON links caption and page |
+| tables | 47,292 | 18.6% | median 210 characters, 1% above 10 k; 60% mostly numeric; about 10% have only empty cells; only 30% have a "Table N" caption nearby; scanned tables are often garbled |
+| display equations | 67,824 | 3.3% | one `$$...$$` line each, often with an equation number |
+| inline math | 704,000 spans | in prose | part of the sentences around them |
+
+### 5.2 Element records
+
+At ingest each document gets zero or more element records:
+
+```
+elements(id, doc_id, kind {figure, table, equation}, number, caption,
+         lines, pages, asset_ref, quality, created_at)
+element_descriptions(element_id, text, model, created_at, created_by)
+```
+
+- `number` is the printed label (`Figure 3`, `Table 2`, `(12)`) when one is found.
+- `lines` and `pages` locate the element in the stored Markdown and the PDF.
+- `asset_ref` points to an image in the configured blob store (figures only); images are
+  served through pg-retrieve so collection rights apply.
+- `quality` is a flag from simple checks (for tables: share of empty cells, garbled
+  numbers) so that broken elements can be left out of the index.
+- Descriptions are optional, may come from several models, and are always marked as
+  generated. They arrive by ingest or by a `write` on the document, never from the search
+  service itself.
+
+The Markdown keeps the elements in place, so reading a document is unchanged.
+
+### 5.3 What the chunker does with them
+
+How each kind is indexed is a chunker option, so it is part of the index (section 3) and
+an evaluation can compare variants. Defaults:
+
+- **Figures:** the image link is removed from the chunk text; the caption stays in the
+  surrounding text chunk.
+- **Tables:** a table goes into its own chunk with its caption and header row, and is
+  split by rows with the header repeated when it exceeds the chunk size. Tables flagged as
+  broken are not indexed. Small tables stay in the text chunk.
+- **Equations:** stay inline in the text chunk. Their symbols reach the lexical leg through
+  the normaliser (section 2); the vector leg sees them as part of the prose.
+
+Element chunks carry `kind` so search can include or exclude them; descriptions, once they
+exist, become additional text of the element chunk.
+
+### 5.4 Later
+
+- Generated descriptions for figures, tables and equations, piloted on a sample first.
+- MCP: `outline` lists elements; a `get_element` tool returns caption, descriptions, page
+  and, for figures, the image as MCP image content.
+- Structured table data (rows and columns) for result tables. The per-document cards
+  upstream already extract measurements; whether pg-retrieve exposes them is open.
