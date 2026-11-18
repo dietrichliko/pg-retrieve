@@ -152,6 +152,23 @@ model endpoint. CERN-specific facts live in `docs/cern-infrastructure.md`.
 - Tests with pytest against a local PostgreSQL 17 + pgvector container. Mock model
   calls in unit tests.
 
+## Development
+
+- `uv` is installed outside the project; `direnv` (`.envrc`) syncs and activates
+  `.venv`. Dev tools are the `dev` dependency group: ruff, mypy (strict), pytest,
+  pre-commit, commitizen. Settings live in `pyproject.toml`.
+- pre-commit runs ruff, mypy, `uv lock` checks and a commitizen `commit-msg` hook, so
+  commit messages must be conventional commits (`feat:`, `fix:`, `docs:`, ...). Only
+  `feat` and `fix` (and breaking changes) bump the version.
+- CI (`.github/workflows/ci.yml`) runs lint, types and tests on every push and builds
+  the sdist and wheel as an artifact.
+- Releases: `scripts/release.sh [--dry-run] [patch|minor|major|<version>]` on a clean,
+  pushed `main`. `cz bump` updates every version location (`pyproject.toml`, `uv.lock`
+  and the `version_files` list in `[tool.commitizen]`; add new places there), writes
+  `CHANGELOG.md`, commits and tags `v<version>`. Pushing the tag triggers
+  `.github/workflows/release.yml`, which creates the GitHub release with the built
+  packages.
+
 ## Working rules
 
 - **Spec first.** Write or update `docs/spec.md` before implementing a component. Ask

@@ -1,0 +1,44 @@
+[project]
+name = "pg-retrieve"
+version = "0.1.0"
+description = "Hybrid search over Markdown documents on PostgreSQL with pgvector"
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.13,<0.14"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "N", "PT"]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers"]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version_provider = "uv"
+tag_format = "v$version"
+version_scheme = "pep440"
+major_version_zero = true
+update_changelog_on_bump = true
+changelog_incremental = true
+version_files = ["src/pg_retrieve/__init__.py:__version__"]
+
+[dependency-groups]
+dev = [
+    "commitizen>=4.19.3",
+    "mypy>=2.4.1",
+    "pre-commit>=4.7.0",
+    "pytest>=9.2.0",
+    "ruff>=0.17.5",
+]
