@@ -32,6 +32,27 @@ Other facts:
 - Check the live instance rather than this table: `SELECT * FROM pg_available_extensions`.
   The `check-postgres-target` skill does this.
 
+### Live check of an existing instance (2026-11-19)
+
+`check-postgres-target` run as `admin` against an older DBOD instance (not the
+pg-retrieve one). Re-run on the PostgreSQL 17 instance before relying on it.
+
+- PostgreSQL 15.15. Password authentication; psql first tries GSSAPI, which fails
+  harmlessly (`gssencmode=disable` silences it).
+- Available: `vector` **0.8.0** (newer than the 0.7.0 in the DBOD extension list, so the
+  shipped version differs by package), `pg_trgm` 1.6, `unaccent` 1.1, `btree_gin` 1.3,
+  `pg_cron` 1.6, `pg_stat_statements` 1.10. 69 extensions in total.
+- `pg_textsearch` not available. The tsvector backend is the default.
+- Text search configs: the 29 built-in ones, including `english`, `simple`, `german`,
+  `french`, `italian`, `russian`.
+- Settings: `shared_buffers` 1 GB, `max_connections` 100, `work_mem` 4 MB,
+  `maintenance_work_mem` 64 MB (too small for a fast HNSW build over 150k vectors;
+  raise it per session in the index build).
+- `admin` is not superuser but has `CREATEDB` and `CREATEROLE`. It cannot create in the
+  `postgres` database (owned by `postgres`), so pg-retrieve needs its own database
+  created by `admin`.
+- `admin` cannot read `shared_preload_libraries` (needs `pg_read_all_settings`).
+
 ### pg_textsearch (checked 2026-11-16)
 
 Source: [timescale/pg_textsearch](https://github.com/timescale/pg_textsearch), v1.5.1,

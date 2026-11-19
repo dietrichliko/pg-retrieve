@@ -50,3 +50,7 @@ migrations. Read-only: it only queries catalog views and settings.
 - A managed service usually lets the owner edit `postgresql.conf` only within limits.
   On DBOD `shared_buffers` is capped at 2 GB and `max_connections` at 150.
 - Do not run `CREATE EXTENSION` from this skill. That belongs in a migration.
+- On DBOD the `admin` role cannot read `shared_preload_libraries`, so that row is
+  missing from **settings**. Treat it as "not preloaded" unless the DBOD team says
+  otherwise. If psql reports a GSSAPI failure before the password step, add
+  `gssencmode=disable` to the connection string.
