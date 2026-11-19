@@ -2,7 +2,7 @@
 
 Status: in progress. Sections written so far: collections and access control (1), the
 lexical normaliser (2), indexes (3), MCP server (4), document elements (5, a
-placeholder), lexical backends (6), bibliographic data (7). Still to write: data model for documents and chunks, ingest, search
+placeholder), lexical backends (6), bibliographic data and links (7). Still to write: data model for documents and chunks, ingest, search
 pipeline, HTTP API, configuration. Each component gets its section
 here before implementation.
 
@@ -867,24 +867,35 @@ planned: at this corpus size it is tens of millions of rows for little gain over
 - The DBOD ticket for `pg_textsearch` is held until the comparison in 6.6 has numbers
   (decided 2026-11-19).
 
-## 7. Bibliographic data
+## 7. Bibliographic data and links
 
 ### 7.1 Purpose and boundary
 
 Scientific corpora are the main target, and their authors, identifiers and references
 are facts readers and agents ask about: who wrote what, what a note cites, what cites
-it. pg-retrieve stores these as source facts with provenance, as the catalogue and the
-document state them. Interpretation built on top (concepts, measurements, which analysis
+it. Pages written in the service, such as wiki pages in a writable collection, link to
+each other and to sources. pg-retrieve stores both kinds of edge as facts with
+provenance, as the catalogue, the source document or the author of a page state them.
+Interpretation built on top (concepts, measurements as records, which analysis
 supersedes which, links an LLM infers) belongs to a future knowledge layer such as the
-wiki, which may use a graph model; it is not part of this service.
+wiki; it is not part of this service.
 
-Everything here is optional. A corpus without bibliographic data leaves the tables
-empty and loses nothing else.
+Two things are modelled:
+
+- **Persons** linked to documents: authors, supervisors, editors. These are filters, not
+  something to follow.
+- **Links** between documents, one table for every kind of edge: bibliographic
+  references from source documents and links written in Markdown pages. They share
+  queries (outgoing, incoming, chains), the access rule and provenance; they differ in
+  origin and in whether they are checked (7.5).
+
+Everything here is optional. A corpus without bibliographic data or links leaves the
+tables empty and loses nothing else.
 
 At the scale of the reference corpus (about 3,300 documents, 183,000 author entries,
-an estimated 100,000 references) PostgreSQL with recursive queries answers citation and
-co-author questions in milliseconds; a graph database would add a second store with its
-own access control for no gain.
+an estimated 100,000 references) PostgreSQL with recursive queries answers citation,
+backlink and co-author questions in milliseconds; a graph database would add a second
+store with its own access control for no gain.
 
 ### 7.2 What the reference corpus provides
 
@@ -899,6 +910,8 @@ Measured on 2026-11-19:
   2,446); 110 supervisor entries.
 - References exist only as bibliography sections in the Markdown: clean for born-digital
   documents, noisy for scans. Nothing is extracted yet.
+- The source documents contain no wikilinks. The wiki pages built from them upstream
+  do, mostly in tables of extracted values and references.
 
 ### 7.3 Data
 
@@ -908,12 +921,18 @@ document_identifiers(doc_id, scheme, value)          -- scheme: report, doi, arx
 persons(id, display_name, name_key, orcid NULL, inspire_id NULL)
 document_persons(doc_id, person_id, role, position, affiliations text[],
                  name_as_written)                    -- role: author, supervisor, editor
-references(id, doc_id, position, raw_text, lines, pages,
-           target_doc_id NULL, target_scheme NULL, target_value NULL,
-           kind, resolved_by, created_at)            -- kind: cites, erratum_of,
-                                                     --   supersedes, ...
+links(id, doc_id, kind, position, lines, pages,
+      target_doc_id NULL, target_section NULL,       -- resolved target in the service
+      target_scheme NULL, target_value NULL,         -- external identifier
+      text NULL,                                     -- reference text or link label
+      status, origin, created_at)
 ```
 
+- **Kinds.** Reference kinds: `cites`, `erratum_of`, `supersedes`, `see_also`, extendable.
+  Page link kind: `links_to`. The kind decides origin and checking (7.5).
+- **Status.** `resolved` (target document in the service), `external` (an identifier
+  outside the service), `unresolved` (nothing matched). `origin` records who produced the
+  edge: `ingest` (payload), `server` (extracted from Markdown or re-resolved).
 - **Identifiers** are normalised on ingest (lowercase DOI, arXiv without version, report
   numbers with collapsed whitespace) so references can be matched against them.
 - **Persons.** `name_key` is a normalised form (surname plus initials, accents folded).
@@ -921,14 +940,11 @@ references(id, doc_id, position, raw_text, lines, pages,
   or the name key matches and neither side has a conflicting id. pg-retrieve does not
   attempt further disambiguation; better identities come from upstream and replace rows
   on re-ingest. `name_as_written` keeps the catalogue string.
-- **References** keep the raw text and its position in the document, with line and page
-  provenance like chunks. A reference resolves to a document of the same service when
-  its identifier matches `document_identifiers`; otherwise it keeps the external
-  identifier, or only the raw text.
-- All rows belong to a document and are replaced with it on re-ingest, keyed on the
-  document's content hash like chunks. They do not depend on the index.
+- Every link keeps its position in the document with line and page provenance, like
+  chunks. Persons, identifiers and links belong to a document and are replaced with it
+  on re-ingest or rewrite. They do not depend on the index.
 
-### 7.4 Ingest
+### 7.4 References (ingest)
 
 - Authors and identifiers come with the document: the frontmatter fields above, or an
   optional `bibliography` object in the ingest payload (authors with affiliations and
@@ -939,48 +955,89 @@ references(id, doc_id, position, raw_text, lines, pages,
   parsing bibliography sections) and posted with the document. pg-retrieve never calls an
   external bibliographic service itself: the only outbound destination is the configured
   model endpoint.
-- After each ingest the server re-resolves unresolved references against all identifiers
-  in the service, so a reference to a document ingested later resolves without
-  re-posting. `resolved_by` records `ingest` or `server`.
+- After each ingest the server re-resolves `unresolved` and `external` references against
+  all identifiers in the service, so a reference to a document ingested later resolves
+  without re-posting.
+- References are never checked or rejected: they are facts about a source document,
+  including its mistakes.
 
-### 7.5 Access
+### 7.5 Page links (extracted and checked)
 
-- A person, identifier or reference is visible only through a document the principal can
+The server extracts `links_to` edges from the Markdown of every document it stores, on
+ingest and on every write (section 4.5). Recognised forms:
+
+| Form | Example |
+|---|---|
+| wikilink | `[[delphi-1995-012-phys-487]]`, `[[delphi-1995-012-phys-487|label]]` |
+| wikilink to a section | `[[delphi-1995-012-phys-487#4.2]]`, `[[...#Systematic errors]]` |
+| wikilink to another collection | `[[delphi/notes/delphi-1995-012-phys-487]]` |
+| resource URI | `[label](pg-retrieve://delphi/notes/delphi-1995-012-phys-487)` |
+
+- A bare id resolves in the page's own collection first, then in collections whose name
+  shares its prefix (`delphi/*`), then fails. Links point to document ids, which never
+  change; titles are only labels, so editing a title breaks nothing.
+- A section target is checked against the target's outline (number or heading path).
+- Links inside code blocks and inline code are ignored. Ordinary web URLs are not edges.
+- **Checking** is a per-collection setting, `links.unresolved`:
+  - `flag` (default): the write succeeds, the link is stored as `unresolved`, and the
+    response lists it.
+  - `reject`: a write with an unresolved `links_to` edge fails with the list of broken
+    links. Nothing is stored.
+  With `reject` no broken link can enter the collection, which replaces a lint pass.
+- **Deleting a linked document.** `delete_document` reports readable incoming
+  `links_to` edges. In a `reject` collection it refuses while any exist unless `force`
+  is given; forced or not, the edges become `unresolved` and stay visible to the linking
+  pages' writers.
+- Changing `links.unresolved` to `reject` does not touch existing pages; the response of
+  the settings change lists the collection's unresolved links.
+
+### 7.6 Access
+
+- A person, identifier or link is visible only through a document the principal can
   read. Author queries return only readable documents.
-- A reference whose target document is in a collection the principal cannot read is
-  shown as unresolved, with its raw text and external identifier: the edge does not
-  reveal that the hidden document exists.
+- A link whose target document is in a collection the principal cannot read is shown as
+  unresolved, with its text and external identifier: the edge does not reveal that the
+  hidden document exists. For checking (7.5) the writer's own rights apply: a link to a
+  document the writer cannot read counts as unresolved.
 - Writing bibliographic data needs `write` on the document's collection, as for the
-  document itself.
+  document itself. Changing `links.unresolved` needs `admin`.
 
-### 7.6 Search and MCP
+### 7.7 Search and MCP
 
 - **Filters.** `author` (name or person id, matching any role) and `identifier`
   (`scheme:value`) join the metadata filters of `search` and `list_documents`.
   `max_authors` excludes collaboration papers, since a filter on a collaboration
   member's name otherwise returns every paper of the collaboration.
-- **`outline`** includes authors (truncated beyond 20 with the count), identifiers and
-  the number of references and of readable citing documents.
-- **New tools:**
+- **`outline`** includes authors (truncated beyond 20 with the count), identifiers, the
+  number of outgoing links per kind and of readable incoming links.
+- **Tools:**
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `get_references` | `doc_id`, `limit`, `cursor` | the document's references in order: raw text, lines and pages, the resolved document (id, title, year) when readable, otherwise the external identifier |
-| `cited_by` | `doc_id`, `limit`, `cursor` | readable documents that cite it, with the citing reference's lines and pages |
+| `get_links` | `doc_id`, `kind` (optional, list), `status` (optional), `limit`, `cursor` | the document's outgoing links in order: kind, text, lines and pages, the resolved document (id, title, year, section) when readable, otherwise the external identifier |
+| `linked_from` | `doc_id`, `kind` (optional, list), `limit`, `cursor` | readable documents with links to it (citing papers, wiki pages), each with the kind and the linking lines and pages |
 | `find_person` | `name` or `orcid` | matching persons with their readable document count and years |
 
-  The server instructions add: follow references with `get_references` and `cited_by`
-  rather than searching for titles, and treat unresolved references as leads outside
-  the corpus.
-- The HTTP API exposes the same under `/documents/{id}/references`,
-  `/documents/{id}/cited-by` and `/persons`.
-- Ranking does not use citations. Boosting by citation count is a possible later option
-  for the evaluation, not part of this section.
+  The write tools (4.5) return the extracted links and any unresolved ones.
+  The server instructions add: follow references and page links with `get_links` and
+  `linked_from` rather than searching for titles; treat external and unresolved
+  references as leads outside the corpus; in a `reject` collection, fix or remove broken
+  links instead of retrying the write.
+- The HTTP API exposes the same under `/documents/{id}/links`,
+  `/documents/{id}/linked-from` and `/persons`.
+- Ranking does not use links. Boosting by citation or backlink count is a possible later
+  option for the evaluation, not part of this section.
 
-### 7.7 Decisions taken
+### 7.8 Decisions taken
 
-- Authors, identifiers and references are stored in pg-retrieve as source facts;
-  derived knowledge stays outside (decided 2026-11-19).
+- Authors, identifiers, references and page links are stored in pg-retrieve as facts
+  with provenance; derived knowledge stays outside (decided 2026-11-19).
+- One link table for references and page links, distinguished by kind; persons are
+  separate (decided 2026-11-19).
+- Markdown stays the source of truth for pages; links are a relation derived from it on
+  every write and checked there, per collection, instead of by a separate lint pass
+  (decided 2026-11-19). Whether the wiki itself lives in git or in a writable collection
+  is the wiki's decision; the link table works for both.
 - No graph database: PostgreSQL tables with recursive queries at this scale.
 - Extraction and resolution against external catalogues happen upstream; the server
-  only resolves against identifiers it already holds.
+  only resolves against identifiers it already holds and extracts page links itself.
