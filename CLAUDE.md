@@ -34,9 +34,9 @@ model endpoint. CERN-specific facts live in `docs/cern-infrastructure.md`.
 
 ## Hard constraints
 
-- **Database.** PostgreSQL 17 with pgvector. Assume pgvector 0.7.x as the floor: the
-  reference instance has 0.7.0, which has no iterative HNSW scan, so filtered vector
-  queries must not depend on pgvector 0.8 features. Use only extensions available on a
+- **Database.** PostgreSQL 17 with pgvector 0.8.2 or newer, the version on the
+  reference instance. Filtered vector queries may rely on the iterative HNSW scan
+  (`hnsw.iterative_scan`). Use only extensions available on a
   managed service; the reference list is in `docs/cern-infrastructure.md`. ParadeDB is
   ruled out.
 - **BM25.** Lexical search sits behind an interface with two backends:
@@ -118,8 +118,8 @@ model endpoint. CERN-specific facts live in `docs/cern-infrastructure.md`.
    - Agent queries: the agent supplies separate `lex` and `vec` queries itself, so the
      API must accept them separately and skip expansion.
 7. **Filters.** Filter by metadata (topics, detectors, years, document type) before
-   ranking. With pgvector 0.7 a selective filter can starve the HNSW scan, so the vector
-   leg must raise `ef_search` or over-fetch when a filter is active.
+   ranking. The vector leg uses pgvector's iterative HNSW scan when a filter is active,
+   so a selective filter does not starve the result list.
 
 ## Interfaces
 
@@ -215,8 +215,6 @@ model endpoint. CERN-specific facts live in `docs/cern-infrastructure.md`.
 
 Verified facts go to `docs/cern-infrastructure.md`; decisions go to `docs/spec.md`.
 
-- **Check the existing DBOD instance** for `pg_textsearch` and the pgvector version
-  with the `check-postgres-target` skill, before asking DBOD for anything.
 - **Embedding model.** Candidates: `embeddinggemma-300m` on the gateway (multilingual,
   dimension to measure) and Qwen3-Embedding run by us on a T4 at ml.cern.ch.
   `e5-large-v2` is out (English only, 512 tokens). Measure dimensions with the

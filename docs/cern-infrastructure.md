@@ -14,7 +14,7 @@ Extensions in the DBOD server package that matter here:
 
 | Extension | Version | Use |
 |---|---|---|
-| `vector` (pgvector) | 0.7.0 | HNSW and ivfflat. No iterative scan (that is 0.8). |
+| `vector` (pgvector) | 0.7.0 listed | The guide's list is out of date: live instances have 0.8.0 (PG 15) and 0.8.2 (PG 17). |
 | `pg_trgm` | 1.6 | Fuzzy matching, optional. |
 | `unaccent` | present | Text search normalisation. |
 | `btree_gin` | present | Composite metadata indexes. |
@@ -32,7 +32,25 @@ Other facts:
 - Check the live instance rather than this table: `SELECT * FROM pg_available_extensions`.
   The `check-postgres-target` skill does this.
 
-### Live check of an existing instance (2026-11-19)
+### pg-retrieve instance (checked 2026-11-19)
+
+`check-postgres-target` run as `admin` on `dbod-amaldidb.cern.ch:6605`, the instance
+created for pg-retrieve.
+
+- PostgreSQL 17.10. TLS on (connection used SSL). Password authentication; the
+  temporary admin password was replaced on creation day.
+- Available: `vector` **0.8.2**, so the iterative HNSW scan
+  (`hnsw.iterative_scan`) exists for filtered vector queries. `pg_trgm` 1.6,
+  `unaccent` 1.1, `btree_gin` 1.3, `pg_cron` 1.6, `pg_stat_statements` 1.11.
+  76 extensions in total. Nothing beyond `plpgsql` installed yet.
+- `pg_textsearch` not available. The tsvector backend is the default.
+- Settings as on the older instance: `shared_buffers` 1 GB, `max_connections` 100,
+  `work_mem` 4 MB, `maintenance_work_mem` 64 MB.
+- `admin` has `CREATEDB` and `CREATEROLE`, is not superuser, and cannot create in the
+  `postgres` database. Whether `admin` may `CREATE EXTENSION vector` in its own database
+  is still to be confirmed by the first migration.
+
+### Live check of an older instance (2026-11-19)
 
 `check-postgres-target` run as `admin` against an older DBOD instance (not the
 pg-retrieve one). Re-run on the PostgreSQL 17 instance before relying on it.

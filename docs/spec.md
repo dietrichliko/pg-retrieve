@@ -408,7 +408,7 @@ index is about 600 MB of vectors plus an HNSW index of similar size; a 768-dimen
 one about three quarters of that. DBOD caps `shared_buffers` at 2 GB, so three or four
 full-size indexes fit on disk but are not all hot at once. Mitigations, in order:
 
-- store vectors as `halfvec` (pgvector 0.7 supports it, including HNSW), which halves
+- store vectors as `halfvec` (supported by pgvector, including HNSW), which halves
   both the data and the index;
 - run chunking and normaliser experiments on a sample collection rather than the full
   corpus;
