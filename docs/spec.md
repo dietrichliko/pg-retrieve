@@ -2,7 +2,7 @@
 
 Status: in progress. Sections written so far: collections and access control (1), the
 lexical normaliser (2), indexes (3), MCP server (4), document elements (5, a
-placeholder). Still to write: data model for documents and chunks, ingest, search
+placeholder), lexical backends (6). Still to write: data model for documents and chunks, ingest, search
 pipeline, HTTP API, configuration. Each component gets its section
 here before implementation.
 
@@ -348,6 +348,7 @@ An index belongs to one collection and bundles everything that decides what is s
 | `chunker`, `chunker_version` | the chunker plugin and its version |
 | `embed_model`, `embed_fingerprint`, `embed_dim` | the embedding model, its fingerprint (section 1.6), and the vector dimension |
 | `normaliser`, `normaliser_version` | the lexical normaliser (section 2) |
+| `lexical_backend` | `tsvector` or `pg_textsearch` (section 6) |
 | `status` | `building`, `ready`, `retired` |
 
 Documents are shared: one copy of the Markdown per collection, with its metadata,
@@ -690,3 +691,114 @@ exist, become additional text of the element chunk.
   and, for figures, the image as MCP image content.
 - Structured table data (rows and columns) for result tables. The per-document cards
   upstream already extract measurements; whether pg-retrieve exposes them is open.
+
+## 6. Lexical backends
+
+### 6.1 Purpose
+
+The lexical leg must rank like BM25 on a managed PostgreSQL that has no BM25 extension.
+`ts_rank_cd` counts and positions query terms but has no inverse document frequency: a
+common word weighs as much as a rare detector name or decay channel. `pg_textsearch`
+provides BM25 but needs `shared_preload_libraries`, which DBOD does not offer today
+(see `docs/cern-infrastructure.md`). This section adds BM25 computed in plain SQL over the
+tsvector that the default backend stores anyway, so the three rankings can be compared
+before anyone asks a database service for an extension.
+
+### 6.2 Backends and rankers
+
+Two things are separate: what is stored (per index) and how it is ranked (per request).
+
+| Storage (per index) | Ranker | Notes |
+|---|---|---|
+| `tsvector` | `ts_rank_cd` | built-in, no statistics needed |
+| `tsvector` | `bm25` | BM25 in SQL over the same tsvector (6.4) |
+| `pg_textsearch` | `bm25` | the extension's own index and scoring |
+
+- The index records its lexical storage, next to the normaliser (section 3.2). It is set
+  at index creation from `lexical.backend` in the configuration, with `auto` choosing
+  `pg_textsearch` when the extension is installed and `tsvector` otherwise.
+- On `tsvector` storage the ranker is a per-request switch, `lex_ranker`, with the
+  default from `lexical.ranker` (initially `ts_rank_cd`). Switching needs no new index,
+  so an evaluation can compare both on identical data.
+- Results report the lexical score with the ranker that produced it.
+
+### 6.3 Stored data for `tsvector`
+
+Per chunk, built at ingest from the normaliser output with the two-part split of 2.4:
+
+- `tsv tsvector`, with a GIN index. Chunks of all indexes share one table, so the GIN
+  index is on `(index_id, tsv)` through `btree_gin`.
+- `lex_len integer`: the number of lexeme positions in `tsv`, the document length for
+  BM25. Counted the same way as term frequency, so the two are consistent.
+
+Per index, for the `bm25` ranker:
+
+```
+lex_term_stats(index_id, lexeme, df)              -- chunks containing the lexeme
+lex_index_stats(index_id, n_chunks, avg_len, refreshed_at)
+```
+
+Both are filled from `ts_stat` over the index's chunks, one full scan. They are
+approximate by design: BM25 is insensitive to small drift in `df`, `N` and `avgdl`.
+
+### 6.4 BM25 query
+
+1. Normalise the lexical query and turn it into lexemes with the same two-part split as
+   the documents. Duplicates are kept as query term frequency, which is then ignored
+   (each distinct term counts once, as in common BM25 implementations).
+2. Candidates: chunks of the index with `tsv @@` the OR of the lexemes, restricted by
+   the request's collections and metadata filters in the same statement.
+3. Candidate cap: when the summed `df` of the query terms exceeds
+   `lexical.bm25.max_candidates` (default 20000), only the rarer terms (ascending `df`,
+   until the sum fits) form the candidate predicate. All terms are still scored. A query
+   made only of very common terms falls back to the full OR with the cap as a `LIMIT`
+   after a `ts_rank_cd` pre-order.
+4. Score each candidate with `unnest(tsv)`, where term frequency is the number of
+   positions of the lexeme:
+
+   ```
+   score = Σ_terms  idf · tf · (k1 + 1) / (tf + k1 · (1 − b + b · lex_len / avg_len))
+   idf   = ln(1 + (N − df + 0.5) / (df + 0.5))
+   ```
+
+   `k1` (default 1.2) and `b` (default 0.75) come from configuration. The `idf` form is
+   the one that never goes negative. A lexeme missing from `lex_term_stats` (added since
+   the last refresh) counts with `df = 1`.
+5. Order by score, return the top `n` for fusion.
+
+Phrases and exclusions in the lexical query are constraints on the candidate set, not
+part of the score; their syntax belongs to the search pipeline section.
+
+Known limits of the tsvector representation: at most 256 positions per lexeme, positions
+capped at 16383, and 1 MB per tsvector. With chunks of about 900 tokens none of these is
+reached.
+
+### 6.5 Statistics refresh
+
+- Refreshed for an index when it is set to `ready`, and after writes to it, debounced
+  to at most once per `lexical.bm25.refresh_interval` (default 10 minutes). The refresh
+  runs in the service, not through `pg_cron`, so nothing depends on an extension.
+- A refresh replaces the index's rows in one transaction; searches see either the old
+  or the new statistics.
+- While an index has no statistics yet (`building`, no refresh), the `bm25` ranker
+  falls back to `ts_rank_cd` and the result says so.
+
+### 6.6 Performance and the case for pg_textsearch
+
+The cost of 6.4 grows with the candidate set, because every candidate's tsvector is
+unnested and scored, where `pg_textsearch` can stop early inside its index. For about
+150k chunks the expected latency is tens to a few hundred milliseconds; this is measured
+on the reference instance before the ranker becomes a default.
+
+The evaluation repository compares `ts_rank_cd`, `bm25` (SQL) and fused results. A request
+to a database service for `pg_textsearch` is made when that comparison shows either that
+BM25 ranking matters and the SQL version is too slow, or that the SQL version is good
+enough and no request is needed. A posting table (one row per lexeme and chunk) is not
+planned: at this corpus size it is tens of millions of rows for little gain over 6.4.
+
+### 6.7 Decisions taken
+
+- BM25 in SQL is a ranker on the `tsvector` storage, selectable per request, not a
+  third storage backend (decided 2026-11-19).
+- The DBOD ticket for `pg_textsearch` is held until the comparison in 6.6 has numbers
+  (decided 2026-11-19).

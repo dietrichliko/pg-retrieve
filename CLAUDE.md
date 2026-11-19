@@ -42,9 +42,10 @@ model endpoint. CERN-specific facts live in `docs/cern-infrastructure.md`.
 - **BM25.** Lexical search sits behind an interface with two backends:
   - `pg_textsearch` (BM25), preferred where installed. It needs
     `shared_preload_libraries` and a restart, so managed services rarely have it.
-  - Built-in `tsvector`/`ts_rank_cd`, the fallback and the default.
+  - Built-in `tsvector`, the fallback and the default. It ranks with `ts_rank_cd` or
+    with BM25 computed in SQL from stored term statistics, switchable per request.
   The backend is chosen by config, with auto-detection from `pg_available_extensions`
-  as a convenience.
+  as a convenience. Spec: `docs/spec.md` section 6.
 - **Model backends.** Every model stage (embedding, query expansion, rerank) sits behind
   an interface with two backends, chosen by config:
   - `openai`: any OpenAI-compatible endpoint (`/v1/models`, `/embeddings`,
@@ -195,8 +196,9 @@ model endpoint. CERN-specific facts live in `docs/cern-infrastructure.md`.
 ## Docs and skills
 
 - `docs/spec.md` — the design spec. Sections 1 (collections and access control),
-  2 (lexical normaliser), 3 (indexes), 4 (MCP server) and 5 (document elements, a
-  placeholder for figures, tables and equations) are written; the other sections come
+  2 (lexical normaliser), 3 (indexes), 4 (MCP server), 5 (document elements, a
+  placeholder for figures, tables and equations) and 6 (lexical backends, including
+  BM25 in SQL) are written; the other sections come
   before their components.
 - `docs/cern-infrastructure.md` — verified facts about DBOD, the AI gateway and
   ml.cern.ch, with dates. Update it when re-checked.
