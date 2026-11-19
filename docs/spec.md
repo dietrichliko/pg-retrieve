@@ -2,7 +2,7 @@
 
 Status: in progress. Sections written so far: collections and access control (1), the
 lexical normaliser (2), indexes (3), MCP server (4), document elements (5, a
-placeholder), lexical backends (6). Still to write: data model for documents and chunks, ingest, search
+placeholder), lexical backends (6), bibliographic data (7). Still to write: data model for documents and chunks, ingest, search
 pipeline, HTTP API, configuration. Each component gets its section
 here before implementation.
 
@@ -173,8 +173,11 @@ tokens(id, principal_id, hash UNIQUE, label, created_at, expires_at, last_used_a
 group_members(group_name, principal_id)            -- static provider only
 collections(id, name UNIQUE, description, default_index_id, created_at)
 indexes(id, collection_id, name, chunker, chunker_version, embed_model,
-        embed_fingerprint, embed_dim, normaliser, normaliser_version, status,
-        created_at, UNIQUE (collection_id, name))
+        embed_fingerprint, embed_dim, normaliser, normaliser_version,
+        lexicon_id NULL, lexical_backend, status, created_at,
+        UNIQUE (collection_id, name))
+lexicons(id, collection_id NULL, name, version, hash, body jsonb, created_by,
+         created_at, UNIQUE (collection_id, name, version))   -- NULL = service scope
 grants(id, subject_kind {principal,group}, subject, collection_pattern, role,
        granted_by, created_at)
 audit(id, at, principal_id, action, collection, object_id, outcome, detail)
@@ -239,31 +242,39 @@ class Normaliser(Protocol):
     name: str          # "none", "physics", or a third-party name
     version: str       # changes whenever the output can change (code or lexicon)
     def normalize(self, text: str) -> str: ...
+
+class NormaliserFactory(Protocol):
+    uses_lexicon: bool
+    def __call__(self, lexicon: dict | None) -> Normaliser: ...
 ```
+
+The factory is the entry point. A normaliser that uses a lexicon receives the parsed
+lexicon version the index names (2.6); it never reads files.
 
 - `normalize` keeps newlines outside math spans, so line-based snippet selection still
   works, and returns lowercase ASCII tokens for symbols with plain words unchanged.
 - Both lexical backends call it: on the document text before `to_tsvector` or the BM25
   index, and on the lexical query before `to_tsquery` or the BM25 query. Nothing else
   calls it.
-- The index stores `normaliser` and `normaliser_version`. A mismatch at ingest is an
-  error. A new normaliser version means a new index; it can share nothing with the old
+- The index stores `normaliser`, `normaliser_version` and, for normalisers that use
+  one, the exact lexicon version (2.6). A mismatch at ingest is an error. A new normaliser version means a new index; it can share nothing with the old
   one at the interface level, though an implementation may copy vectors when only the
   normaliser differs.
 
 Built-ins:
 
 - `none`: identity. The default for a general corpus.
-- `physics`: the port of `searchnorm.mjs`, driven by a lexicon file (2.3).
+- `physics`: the port of `searchnorm.mjs`, driven by a lexicon (2.3, 2.6).
 
-### 2.3 Lexicon file
+### 2.3 Lexicon format
 
 The `physics` normaliser separates code from data. The code handles what needs a parser:
 math span detection (`$...$`, `$$...$$`, `\(...\)`, `\[...\]`, one span per line),
 sub- and superscript folding (`B^0_s` and `B_s^0` to `b0s`, charge before subscript, a
 numeric power after a subscript dropped), stripping of font wrappers and layout commands,
 `\bar`, `\sqrt`, units, and stemmer protection. Everything that is a table lives in a
-JSON file, so another domain can change the vocabulary without code:
+JSON lexicon, stored in the database and managed through the API (2.6), so another domain
+can change the vocabulary without code or a redeploy:
 
 ```
 {
@@ -287,11 +298,16 @@ JSON file, so another domain can change the vocabulary without code:
 - The first seven tables are exactly what the sibling repository exports with
   `delphi-kb-searchnorm export`, so the two stay in step by copying one file.
 - `aliases` is new. Each value is a list of literal phrases, or regexes written between
-  slashes, replaced by the canonical token in both documents and queries. This is where an
+  slashes, replaced by the canonical token in both documents and queries. Regexes are
+  accepted only in service-wide lexicons (2.6), because a pathological pattern can stall
+  the service; collection lexicons use literal phrases. This is where an
   LLM-built lexicon of the long tail goes, and where a different domain adds its own
   vocabulary. Longer phrases are applied first. A phrase is matched case-insensitively on
   word boundaries.
-- The normaliser's `version` is `physics-<code version>-<lexicon version>`.
+- The `version` field inside the file is informative. The normaliser's `version` is
+  `physics-<code version>-<lexicon hash>`, where the hash is the first 12 hex digits of
+  the SHA-256 of the canonical JSON (sorted keys, no whitespace), so equal content gives
+  an equal version wherever it was uploaded.
 
 ### 2.4 Stemmer interaction
 
@@ -317,15 +333,62 @@ The cases file format is domain-independent and ships with the normaliser:
 }
 ```
 
-`pg-retrieve normaliser check <lexicon> <cases>` runs them, so a user validating their
-own lexicon needs no test code. The DELPHI cases file from the sibling repository is the
+`pg-retrieve normaliser check --lexicon <file or name@version> --cases <file>` runs them
+through the service (`POST /lexicons/check`), so the result reflects the server's
+normaliser code and the database tokeniser, and a user validating their own lexicon needs
+no test code. The DELPHI cases file from the sibling repository is the
 fixture for the `physics` normaliser, and must pass on both backends against the actual
 database tokeniser, not only on the Python output.
 
-### 2.6 Decisions taken
+### 2.6 Lexicon storage and API
+
+Lexicons are data in the database, not files in the image or a mount, so the service
+keeps no local state and several groups sharing one service can each have their own
+vocabulary.
+
+- **Objects.** A lexicon has a name and numbered versions. A version is immutable: an
+  upload creates the next version with its content hash, and nothing is edited in place.
+- **Scope.** A lexicon belongs either to one collection or to the service.
+  - Collection lexicons are uploaded by an `admin` of that collection and can be used
+    only by indexes of that collection.
+  - Service lexicons are uploaded by service administrators and can be used by any index.
+  - The package ships the `physics` lexicon (the DELPHI vocabulary exported from the
+    sibling repository). The service registers it as a service lexicon at start-up when
+    its hash is not yet present, so a fresh installation works without an upload.
+- **Indexes pin a version.** Creating an index names a normaliser and, if it uses one, a
+  lexicon reference `name@version` or `name@latest`. The reference is resolved once, at
+  creation, to an exact version; `latest` never moves an existing index. A lexicon change
+  is therefore a new index (section 3.5), which rebuilds only lexical data.
+- **Validation.** On upload the server checks the JSON against the schema of 2.3, rejects
+  unknown sections, rejects regexes in collection lexicons, and enforces a size limit
+  (`lexicon.max_bytes`, default 1 MB). The normaliser factory must accept it.
+- **Deletion.** A version referenced by any index cannot be deleted. Others can be
+  deleted by whoever could upload them.
+- **Reading.** Readers of a collection can list and fetch its lexicons and the service
+  lexicons, so an evaluation can record exactly which vocabulary an index used.
+
+Endpoints:
+
+| Method and path | Right | Purpose |
+|---|---|---|
+| `GET /lexicons` | authenticated | service lexicons |
+| `POST /lexicons/{name}` | service admin | upload the next version of a service lexicon |
+| `GET /collections/{c}/lexicons` | `read` on `c` | collection lexicons |
+| `POST /collections/{c}/lexicons/{name}` | `admin` on `c` | upload the next version |
+| `GET …/lexicons/{name}/{version}` | as listing | fetch one version (`latest` allowed) |
+| `DELETE …/lexicons/{name}/{version}` | as upload | delete an unreferenced version |
+| `POST /lexicons/check` | `admin` on any collection | run a cases file against a lexicon, uploaded or given inline; stores nothing |
+
+The response of an upload and a fetch carries `name`, `version`, `hash`, `scope`,
+`created_by`, `created_at` and, on fetch, the lexicon itself.
+
+### 2.7 Decisions taken
 
 - Plugin interface with a lexicon-driven built-in, not a rule language (decided
   2026-11-16). The LaTeX handling needs a parser; the vocabulary is data.
+- Lexicons are versioned, immutable objects managed through the API, owned by a
+  collection or by the service, and pinned by indexes (decided 2026-11-19). Normaliser
+  code stays a plugin in the image.
 - Symbol tokens bypass stemming on both backends rather than relying on suffix
   protection (2.4), to be confirmed by the cases file on a real database.
 
@@ -347,7 +410,7 @@ An index belongs to one collection and bundles everything that decides what is s
 | `name` | unique within the collection, for example `default`, `qwen06`, `sem-chunks`, `nonorm` |
 | `chunker`, `chunker_version` | the chunker plugin and its version |
 | `embed_model`, `embed_fingerprint`, `embed_dim` | the embedding model, its fingerprint (section 1.6), and the vector dimension |
-| `normaliser`, `normaliser_version` | the lexical normaliser (section 2) |
+| `normaliser`, `normaliser_version`, `lexicon` | the lexical normaliser and the exact lexicon version it uses (section 2) |
 | `lexical_backend` | `tsvector` or `pg_textsearch` (section 6) |
 | `status` | `building`, `ready`, `retired` |
 
@@ -363,7 +426,8 @@ stored and remain per-request switches.
 
 - Every collection has exactly one default index. A new collection gets a `default`
   index from the service configuration (`index.defaults`: chunker, embedding model,
-  normaliser).
+  normaliser, and a lexicon reference such as `physics@latest`, resolved when the index
+  is created).
 - `search`, `get_chunk` and `outline` take an optional `index` name and fall back to the
   default. A request naming an index that is not `ready` is an error. The HTTP and MCP
   interfaces expose the parameter; the MCP tool description says to omit it unless an
@@ -802,3 +866,121 @@ planned: at this corpus size it is tens of millions of rows for little gain over
   third storage backend (decided 2026-11-19).
 - The DBOD ticket for `pg_textsearch` is held until the comparison in 6.6 has numbers
   (decided 2026-11-19).
+
+## 7. Bibliographic data
+
+### 7.1 Purpose and boundary
+
+Scientific corpora are the main target, and their authors, identifiers and references
+are facts readers and agents ask about: who wrote what, what a note cites, what cites
+it. pg-retrieve stores these as source facts with provenance, as the catalogue and the
+document state them. Interpretation built on top (concepts, measurements, which analysis
+supersedes which, links an LLM infers) belongs to a future knowledge layer such as the
+wiki, which may use a graph model; it is not part of this service.
+
+Everything here is optional. A corpus without bibliographic data leaves the tables
+empty and loses nothing else.
+
+At the scale of the reference corpus (about 3,300 documents, 183,000 author entries,
+an estimated 100,000 references) PostgreSQL with recursive queries answers citation and
+co-author questions in milliseconds; a graph database would add a second store with its
+own access control for no gain.
+
+### 7.2 What the reference corpus provides
+
+Measured on 2026-11-19:
+
+- Frontmatter: `authors`, `author_count`, `collaborations`, and the document's own
+  identifiers `report_numbers`, `doi`, `arxiv`, `inspire`, `cds`, `conferences`.
+- `md/authors.jsonl`: one line per document with an ordered author list (name,
+  affiliations) and, for theses, supervisors. Of 183,214 author entries, 17,773 have
+  affiliations, 7,891 an INSPIRE author record, 5,694 an ORCID, 7,818 a ROR id for the
+  affiliation. 351 documents have more than 100 authors (collaboration papers, up to
+  2,446); 110 supervisor entries.
+- References exist only as bibliography sections in the Markdown: clean for born-digital
+  documents, noisy for scans. Nothing is extracted yet.
+
+### 7.3 Data
+
+```
+document_identifiers(doc_id, scheme, value)          -- scheme: report, doi, arxiv,
+    UNIQUE (scheme, value, doc_id)                   --   inspire, cds, isbn, ...
+persons(id, display_name, name_key, orcid NULL, inspire_id NULL)
+document_persons(doc_id, person_id, role, position, affiliations text[],
+                 name_as_written)                    -- role: author, supervisor, editor
+references(id, doc_id, position, raw_text, lines, pages,
+           target_doc_id NULL, target_scheme NULL, target_value NULL,
+           kind, resolved_by, created_at)            -- kind: cites, erratum_of,
+                                                     --   supersedes, ...
+```
+
+- **Identifiers** are normalised on ingest (lowercase DOI, arXiv without version, report
+  numbers with collapsed whitespace) so references can be matched against them.
+- **Persons.** `name_key` is a normalised form (surname plus initials, accents folded).
+  A person row is shared only when the ingest supplies a stable id (ORCID or INSPIRE),
+  or the name key matches and neither side has a conflicting id. pg-retrieve does not
+  attempt further disambiguation; better identities come from upstream and replace rows
+  on re-ingest. `name_as_written` keeps the catalogue string.
+- **References** keep the raw text and its position in the document, with line and page
+  provenance like chunks. A reference resolves to a document of the same service when
+  its identifier matches `document_identifiers`; otherwise it keeps the external
+  identifier, or only the raw text.
+- All rows belong to a document and are replaced with it on re-ingest, keyed on the
+  document's content hash like chunks. They do not depend on the index.
+
+### 7.4 Ingest
+
+- Authors and identifiers come with the document: the frontmatter fields above, or an
+  optional `bibliography` object in the ingest payload (authors with affiliations and
+  ids, identifiers, references). The payload format is the generic one; the DELPHI
+  frontmatter and `authors.jsonl` are mapped to it by the ingest CLI.
+- References are extracted and, where possible, resolved upstream (for DELPHI in the
+  delphi-knowledge-base repository, for example from INSPIRE reference lists or by
+  parsing bibliography sections) and posted with the document. pg-retrieve never calls an
+  external bibliographic service itself: the only outbound destination is the configured
+  model endpoint.
+- After each ingest the server re-resolves unresolved references against all identifiers
+  in the service, so a reference to a document ingested later resolves without
+  re-posting. `resolved_by` records `ingest` or `server`.
+
+### 7.5 Access
+
+- A person, identifier or reference is visible only through a document the principal can
+  read. Author queries return only readable documents.
+- A reference whose target document is in a collection the principal cannot read is
+  shown as unresolved, with its raw text and external identifier: the edge does not
+  reveal that the hidden document exists.
+- Writing bibliographic data needs `write` on the document's collection, as for the
+  document itself.
+
+### 7.6 Search and MCP
+
+- **Filters.** `author` (name or person id, matching any role) and `identifier`
+  (`scheme:value`) join the metadata filters of `search` and `list_documents`.
+  `max_authors` excludes collaboration papers, since a filter on a collaboration
+  member's name otherwise returns every paper of the collaboration.
+- **`outline`** includes authors (truncated beyond 20 with the count), identifiers and
+  the number of references and of readable citing documents.
+- **New tools:**
+
+| Tool | Parameters | Returns |
+|---|---|---|
+| `get_references` | `doc_id`, `limit`, `cursor` | the document's references in order: raw text, lines and pages, the resolved document (id, title, year) when readable, otherwise the external identifier |
+| `cited_by` | `doc_id`, `limit`, `cursor` | readable documents that cite it, with the citing reference's lines and pages |
+| `find_person` | `name` or `orcid` | matching persons with their readable document count and years |
+
+  The server instructions add: follow references with `get_references` and `cited_by`
+  rather than searching for titles, and treat unresolved references as leads outside
+  the corpus.
+- The HTTP API exposes the same under `/documents/{id}/references`,
+  `/documents/{id}/cited-by` and `/persons`.
+- Ranking does not use citations. Boosting by citation count is a possible later option
+  for the evaluation, not part of this section.
+
+### 7.7 Decisions taken
+
+- Authors, identifiers and references are stored in pg-retrieve as source facts;
+  derived knowledge stays outside (decided 2026-11-19).
+- No graph database: PostgreSQL tables with recursive queries at this scale.
+- Extraction and resolution against external catalogues happen upstream; the server
+  only resolves against identifiers it already holds.
