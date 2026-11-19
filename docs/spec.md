@@ -2,7 +2,8 @@
 
 Status: in progress. Sections written so far: collections and access control (1), the
 lexical normaliser (2), indexes (3), MCP server (4), document elements (5, a
-placeholder), lexical backends (6), bibliographic data and links (7). Still to write: data model for documents and chunks, ingest, search
+placeholder), lexical backends (6), metadata, aliases and links (7), with the scientific profile
+in appendix A. Still to write: data model for documents and chunks, ingest, search
 pipeline, HTTP API, configuration. Each component gets its section
 here before implementation.
 
@@ -867,222 +868,292 @@ planned: at this corpus size it is tens of millions of rows for little gain over
 - The DBOD ticket for `pg_textsearch` is held until the comparison in 6.6 has numbers
   (decided 2026-11-19).
 
-## 7. Bibliographic data and links
+## 7. Metadata, aliases and links
 
 ### 7.1 Purpose and boundary
 
-Scientific corpora are the main target, and their authors, identifiers and references
-are facts readers and agents ask about: who wrote what, what a note cites, what cites
-it. Pages written in the service, such as wiki pages in a writable collection, link to
-each other and to sources. pg-retrieve stores both kinds of edge as facts with
-provenance, as the catalogue, the source document or the author of a page state them.
-Interpretation built on top (concepts, measurements as records, which analysis
-supersedes which, links an LLM infers) belongs to a future knowledge layer such as the
-wiki; it is not part of this service.
+pg-retrieve must stay as generic as qmd: collections of Markdown documents, with nothing
+in the schema that only one domain needs. Documents in every domain still carry
+metadata, have other names (a DOI, a report number, a note's slug), and link to each
+other (wikilinks in notes, references in papers). This section models exactly those
+three generic things:
 
-Two things are modelled:
+- **Metadata**: the document's frontmatter, with filterable fields declared by a profile.
+- **Aliases**: other names of a document, `scheme:value`.
+- **Links**: edges from a document to another document or to an alias, of a named kind,
+  either extracted from the Markdown or supplied with the document.
 
-- **Persons** linked to documents: authors, supervisors, editors. These are filters, not
-  something to follow.
-- **Links** between documents, one table for every kind of edge: bibliographic
-  references from source documents and links written in Markdown pages. They share
-  queries (outgoing, incoming, chains), the access rule and provenance; they differ in
-  origin and in whether they are checked (7.5).
+Everything domain-specific (which frontmatter fields matter, which alias schemes exist
+and how they are normalised, which link kinds exist) is data in a **profile** (7.2), as
+the physics vocabulary is data in a lexicon (2.6). Appendix A is the scientific profile
+used for DELPHI.
 
-One service holds many collections with different audiences (section 1): public papers,
-internal notes, wiki pages, possibly of several experiments. A link can therefore point
-to a document the reader can read, to one the service holds but hides from that reader,
-or to something outside the service. What is stored about a link is the same for
-everyone; what a reader sees is computed per reader (7.6).
+Interpretation built on top (person identities and affiliations, concepts, measurements
+as records, which analysis supersedes which, links an LLM infers) belongs to a future
+knowledge layer such as the wiki, not to this service.
 
-Everything here is optional. A corpus without bibliographic data or links leaves the
-tables empty and loses nothing else.
+One service holds many collections with different audiences (section 1). A link can
+therefore point to a document the reader can read, to one the service holds but hides
+from that reader, or to something outside the service. What is stored about a link is
+the same for everyone; what a reader sees is computed per reader (7.7).
 
-At the scale of the reference corpus (about 3,300 documents, 183,000 author entries,
-an estimated 100,000 references) PostgreSQL with recursive queries answers citation,
-backlink and co-author questions in milliseconds; a graph database would add a second
-store with its own access control for no gain.
+A corpus without metadata, aliases or links leaves the tables empty and loses nothing
+else. At the scale of the reference corpus (about 3,300 documents, an estimated 100,000
+references) PostgreSQL answers filter, backlink and citation-chain queries in
+milliseconds; a graph database would add a second store with its own access control for
+no gain.
 
-### 7.2 What the reference corpus provides
+### 7.2 Profiles
 
-Measured on 2026-11-19:
-
-- Frontmatter: `authors`, `author_count`, `collaborations`, and the document's own
-  identifiers `report_numbers`, `doi`, `arxiv`, `inspire`, `cds`, `conferences`.
-- `md/authors.jsonl`: one line per document with an ordered author list (name,
-  affiliations) and, for theses, supervisors. Of 183,214 author entries, 17,773 have
-  affiliations, 7,891 an INSPIRE author record, 5,694 an ORCID, 7,818 a ROR id for the
-  affiliation. 351 documents have more than 100 authors (collaboration papers, up to
-  2,446); 110 supervisor entries.
-- References exist only as bibliography sections in the Markdown: clean for born-digital
-  documents, noisy for scans. Nothing is extracted yet.
-- The source documents contain no wikilinks. The wiki pages built from them upstream
-  do, mostly in tables of extracted values and references.
-
-### 7.3 Data
+A profile is a JSON object with three parts:
 
 ```
-document_identifiers(doc_id, scheme, value)          -- scheme: report, doi, arxiv,
-    UNIQUE (scheme, value, doc_id)                   --   inspire, cds, isbn, ...
-persons(id, display_name, name_key, orcid NULL, inspire_id NULL)
-document_persons(doc_id, person_id, role, position, affiliations text[],
-                 name_as_written)                    -- role: author, supervisor, editor
+{
+  "fields":  { "<name>": {"type": "...", "from": "<path>"} , ... },     // 7.3
+  "aliases": { "<scheme>": {"from": "<path>", "normalise": [...]}, ... },// 7.4
+  "link_kinds": ["cites", "erratum_of", ...]                             // 7.5
+}
+```
+
+- Profiles are stored and managed exactly like lexicons (2.6): named, versioned,
+  immutable versions with a content hash, owned by a collection or by the service, with
+  the same endpoints under `/profiles` and `/collections/{c}/profiles`. Regex
+  normalisation steps are accepted only in service profiles.
+- Built-in service profiles: `generic` (fields `title`, `tags`, `date`; no alias
+  schemes; link kind `links_to` only) and `scientific` (appendix A).
+- A collection names one profile version (`profile`, default `generic@latest`,
+  resolved when the collection is created). Changing it needs `admin`.
+- Metadata, aliases and links belong to documents, not to indexes, so a profile change
+  needs no new index. The server re-derives filter values and aliases from the stored
+  frontmatter in the background and re-resolves links (7.5); the collection reports
+  progress, and filters use the old values until it completes.
+
+### 7.3 Metadata and filters
+
+- A document's metadata is its frontmatter plus any `metadata` object in the ingest or
+  write payload, stored as JSON with the document. The raw frontmatter is always kept.
+- The profile declares the filterable fields. `from` is a path into the metadata
+  (`year`, `card.topics`), defaulting to the field name. Types:
+
+| Type | Filter semantics |
+|---|---|
+| `keyword` | equality, or any of a list |
+| `keyword[]` | the document's list contains any (or all, with `all: true`) of the values |
+| `int`, `date` | equality, list, or range `{"from": .., "to": ..}` |
+| `person[]` | list of names; matches case- and accent-insensitively on surname, with optional initials (`Hamacher`, `Hamacher K`) |
+| `text` | case-insensitive substring; for titles and short fields only |
+
+- Every list field also accepts a length filter (`{"max_len": 100}`), so for example
+  documents with very long author lists can be excluded without a dedicated parameter.
+- Undeclared metadata is returned in `outline` but cannot be filtered.
+- `list_collections` reports each collection's declared fields with types and example
+  values (section 4.4).
+- Storage: one `metadata jsonb` column with a GIN index, plus the derived filter values.
+  At this corpus size filters on documents are cheap; per-field indexes are not needed.
+
+### 7.4 Aliases
+
+- A document has its id plus any number of aliases `scheme:value` derived by the profile
+  from the metadata (`"doi": {"from": "doi", "normalise": ["lower"]}`) or supplied in the
+  payload.
+- Normalisation steps are a fixed list: `lower`, `upper`, `trim`, `collapse_space`,
+  `strip_prefix:<text>`, and in service profiles `replace:<regex>:<replacement>`.
+  The same steps are applied to a link's target identifier before matching.
+- Aliases are unique per scheme within a collection, not across collections: the same
+  DOI may be held by a public paper and an internal draft in two collections. Two
+  documents of one collection with the same alias are an ingest error.
+- Aliases are addressable: `get_document`, `outline` and wikilinks accept
+  `scheme:value` wherever a document id is accepted.
+
+### 7.5 Links
+
+```
+document_aliases(doc_id, scheme, value)  UNIQUE (collection_id, scheme, value)
 links(id, doc_id, kind, position, lines, pages,
-      target_scheme NULL, target_value NULL,         -- identifier as cited
-      text NULL,                                     -- reference text or link label
-      origin, created_at)
+      target_ref,                         -- doc id or scheme:value as written/cited
+      text NULL,                          -- link label or reference text
+      origin, created_at)                 -- origin: extracted | payload
 link_targets(link_id, target_doc_id, target_section NULL, matched_by)
-                                                     -- every document in the service
-                                                     --   the link matches
 ```
 
-- **Kinds.** Reference kinds: `cites`, `erratum_of`, `supersedes`, `see_also`, extendable.
-  Page link kind: `links_to`. The kind decides origin and checking (7.5).
-- **What is stored** is independent of who reads it: the identifier as cited, the text,
-  and in `link_targets` every document of the service the link matches, in any
-  collection. One identifier can match several documents, for example a public paper and
-  an internal draft of it in another collection. `matched_by` records how (`id`,
-  `doi`, `report`, ...). `origin` records who produced the edge: `ingest` (payload) or
-  `server` (extracted from Markdown).
-- **No stored status.** Whether a link is resolved depends on the reader and is computed
-  when it is read (7.6).
-- **Identifiers** are normalised on ingest (lowercase DOI, arXiv without version, report
-  numbers with collapsed whitespace) so references can be matched against them.
-- **Persons.** `name_key` is a normalised form (surname plus initials, accents folded).
-  A person row is shared only when the ingest supplies a stable id (ORCID or INSPIRE),
-  or the name key matches and neither side has a conflicting id. pg-retrieve does not
-  attempt further disambiguation; better identities come from upstream and replace rows
-  on re-ingest. `name_as_written` keeps the catalogue string.
-- Every link keeps its position in the document with line and page provenance, like
-  chunks. Persons, identifiers and links belong to a document and are replaced with it
-  on re-ingest or rewrite. They do not depend on the index.
+- **Two origins, one table.** `extracted` links come from the Markdown (7.6) and have kind
+  `links_to`. `payload` links arrive with the document, for example the reference list
+  of a paper, extracted upstream, with a kind from the collection's profile; an unknown
+  kind is an ingest error. Payload links are never checked or rejected: they are facts
+  about a source document, including its mistakes.
+- **Targets.** `link_targets` holds every document of the service the target reference
+  matches, by id or by alias, in any collection. One reference can match several
+  documents. `matched_by` records how. There is no stored status: whether a link is
+  resolved depends on the reader (7.7).
+- **Maintenance.** After each ingest, write or delete, and after a profile change, the
+  server updates `link_targets` for links whose reference matches the added, changed or
+  removed document or aliases, in every collection, so a reference to a document
+  ingested later resolves without re-posting.
+- Every link keeps its position with line and page provenance, like chunks, and is
+  replaced with its document on re-ingest or rewrite.
+- pg-retrieve never looks anything up outside itself: the only outbound destination is
+  the configured model endpoint. Resolution against external catalogues happens upstream
+  of the ingest.
 
-### 7.4 References (ingest)
-
-- Authors and identifiers come with the document: the frontmatter fields above, or an
-  optional `bibliography` object in the ingest payload (authors with affiliations and
-  ids, identifiers, references). The payload format is the generic one; the DELPHI
-  frontmatter and `authors.jsonl` are mapped to it by the ingest CLI.
-- References are extracted and, where possible, resolved upstream (for DELPHI in the
-  delphi-knowledge-base repository, for example from INSPIRE reference lists or by
-  parsing bibliography sections) and posted with the document. pg-retrieve never calls an
-  external bibliographic service itself: the only outbound destination is the configured
-  model endpoint.
-- After each ingest, write or delete the server updates `link_targets` for links whose
-  identifiers match the added or removed document, in every collection, so a reference
-  to a document ingested later resolves without re-posting.
-- References are never checked or rejected: they are facts about a source document,
-  including its mistakes.
-
-### 7.5 Page links (extracted and checked)
+### 7.6 Page links: extraction and checking
 
 The server extracts `links_to` edges from the Markdown of every document it stores, on
-ingest and on every write (section 4.5). Recognised forms:
+ingest and on every write (section 4.5):
 
 | Form | Example |
 |---|---|
 | wikilink | `[[delphi-1995-012-phys-487]]`, `[[delphi-1995-012-phys-487|label]]` |
 | wikilink to a section | `[[delphi-1995-012-phys-487#4.2]]`, `[[...#Systematic errors]]` |
+| wikilink by alias | `[[doi:10.1016/0370-2693(95)01234-5]]`, `[[report:DELPHI-95-12]]` |
 | wikilink to another collection | `[[delphi/notes/delphi-1995-012-phys-487]]` |
 | resource URI | `[label](pg-retrieve://delphi/notes/delphi-1995-012-phys-487)` |
 
-- A bare id resolves in the page's own collection first, then in collections whose name
-  shares its prefix (`delphi/*`), then fails. Links point to document ids, which never
-  change; titles are only labels, so editing a title breaks nothing.
+- A bare id or alias resolves in the page's own collection first, then in collections
+  sharing its prefix (`delphi/*`), then anywhere. Links point to ids or aliases, which do
+  not change; titles are only labels, so editing a title breaks nothing.
 - A section target is checked against the target's outline (number or heading path).
 - Links inside code blocks and inline code are ignored. Ordinary web URLs are not edges.
 - **Checking** is a per-collection setting, `links.unresolved`:
   - `flag` (default): the write succeeds, the link is stored without targets, and the
     response lists it as unresolved.
   - `reject`: a write with an unresolved `links_to` edge fails with the list of broken
-    links. Nothing is stored.
-  With `reject` no broken link can enter the collection, which replaces a lint pass.
+    links. Nothing is stored. No broken link can enter the collection, which replaces a
+    lint pass.
+  Checking uses the writer's own rights: a link whose only targets the writer cannot read
+  counts as unresolved for them.
 - **Narrowing links.** When a writer links to a document whose collection is readable by
   fewer principals than the page's own collection, the write succeeds and the response
-  warns that some readers of the page will see only the identifier. The comparison is
-  made on grants (principals, groups and patterns with `read`), so it is approximate when
-  group membership comes from an external provider. It is never an error: linking an
-  internal note from a wider page is the writer's decision.
+  warns that some readers of the page will see only the reference. The comparison is made
+  on grants, so it is approximate when group membership comes from an external provider.
 - **Deleting a linked document.** `delete_document` reports the incoming `links_to` edges
   from documents the deleting principal can read. In a `reject` collection it refuses
   while any exist unless `force` is given; forced or not, those links lose the target.
-- Changing `links.unresolved` to `reject` does not touch existing pages; the response of
-  the settings change lists the collection's unresolved links.
+- Changing `links.unresolved` to `reject` does not touch existing pages; the response
+  lists the collection's unresolved links. The change needs `admin`.
 
-### 7.6 Access and what a reader sees
+### 7.7 Access and what a reader sees
 
 The status of a link is computed for each reader from the stored targets:
 
 | Stored situation | Reader sees |
 |---|---|
-| at least one target in a collection the reader can read | `resolved`: the preferred readable target's id, title, year and section |
-| targets exist, none readable by this reader | `external`: the identifier as cited and the text |
-| no target in the service, identifier present | `external`: the identifier as cited and the text |
-| no target, no identifier | `unresolved`: the text only |
+| at least one target in a collection the reader can read | `resolved`: the preferred readable target's id, title and section |
+| targets exist, none readable by this reader | `external`: the reference as written and the text |
+| no target in the service, reference is an alias | `external`: the reference as written and the text |
+| no target, reference is not an alias (a bare id or free text) | `unresolved` |
 
 - A hidden target and a document the service does not hold look exactly alike, in the
   status and the fields, and are answered by the same query, so readers cannot probe
-  which hidden documents exist. The identifier itself is not secret: it is
-  printed in the citing document, which the reader can read.
-- Among several readable targets the preferred one is in the citing document's own
+  which hidden documents exist. The reference itself is not secret: it is written in the
+  linking document, which the reader can read.
+- Among several readable targets the preferred one is in the linking document's own
   collection, then in a collection sharing its prefix, then the most recent. The others
-  are listed as `also` so a reader can choose.
+  are listed as `also`.
 - Incoming links, counts in `outline`, and any later ranking use only links whose
-  citing document the reader can read. Counting all of them would reveal hidden citing
-  documents.
-- Persons and identifiers are visible only through readable documents. Author queries
-  return only readable documents.
-- Checking on write (7.5) uses the writer's own rights: a link whose only targets the
-  writer cannot read counts as unresolved for them.
-- Writing bibliographic data needs `write` on the document's collection, as for the
-  document itself. Changing `links.unresolved` needs `admin`.
-- External identifiers can carry a URL for clients, from per-scheme templates in config
-  (`links.url_templates`, for example `doi: https://doi.org/{value}`,
-  `arxiv: https://arxiv.org/abs/{value}`). The server builds the string and never fetches
-  it.
+  linking document the reader can read.
+- Metadata and aliases are visible only through readable documents; filters return only
+  readable documents.
+- External references can carry a URL for clients, from per-scheme templates in the
+  profile or config (`doi: https://doi.org/{value}`). The server builds the string and
+  never fetches it.
 
-### 7.7 Search and MCP
+### 7.8 Search and MCP
 
-- **Filters.** `author` (name or person id, matching any role) and `identifier`
-  (`scheme:value`) join the metadata filters of `search` and `list_documents`.
-  `max_authors` excludes collaboration papers, since a filter on a collaboration
-  member's name otherwise returns every paper of the collaboration.
-- **`outline`** includes authors (truncated beyond 20 with the count), identifiers, the
-  number of outgoing links per kind and of readable incoming links.
+- **Filters** in `search` and `list_documents` are the profile's declared fields (7.3),
+  including list-length filters, plus `alias` (`scheme:value`).
+- **`outline`** includes the metadata (long lists truncated with their length), the
+  aliases, the number of outgoing links per kind and of readable incoming links.
 - **Tools:**
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `get_links` | `doc_id`, `kind` (optional, list), `status` (optional), `limit`, `cursor` | the document's outgoing links in order: kind, text, lines and pages, the status for this reader (7.6), the preferred readable target and `also`, or the identifier with its URL |
+| `get_links` | `doc_id`, `kind` (optional, list), `status` (optional), `limit`, `cursor` | the document's outgoing links in order: kind, text, lines and pages, the status for this reader (7.7), the preferred readable target and `also`, or the reference with its URL |
 | `linked_from` | `doc_id`, `kind` (optional, list), `limit`, `cursor` | readable documents with links to it (citing papers, wiki pages), each with the kind and the linking lines and pages |
-| `find_person` | `name` or `orcid` | matching persons with their readable document count and years |
 
   The write tools (4.5) return the extracted links, the unresolved ones and any
-  narrowing warnings.
-  The server instructions add: follow references and page links with `get_links` and
-  `linked_from` rather than searching for titles; treat external and unresolved
-  references as leads outside the corpus; in a `reject` collection, fix or remove broken
-  links instead of retrying the write.
-- The HTTP API exposes the same under `/documents/{id}/links`,
-  `/documents/{id}/linked-from` and `/persons`.
-- Ranking does not use links. Boosting by citation or backlink count is a possible later
-  option for the evaluation, not part of this section.
+  narrowing warnings. The server instructions add: follow links with `get_links` and
+  `linked_from` rather than searching for titles; treat external references as leads
+  outside the corpus; in a `reject` collection, fix or remove broken links instead of
+  retrying the write.
+- The HTTP API exposes the same under `/documents/{id}/links` and
+  `/documents/{id}/linked-from`.
+- Ranking does not use links. Boosting by incoming link count is a possible later option
+  for the evaluation, not part of this section.
 
-### 7.8 Decisions taken
+### 7.9 Decisions taken
 
-- Authors, identifiers, references and page links are stored in pg-retrieve as facts
-  with provenance; derived knowledge stays outside (decided 2026-11-19).
-- One link table for references and page links, distinguished by kind; persons are
-  separate (decided 2026-11-19).
-- Markdown stays the source of truth for pages; links are a relation derived from it on
-  every write and checked there, per collection, instead of by a separate lint pass
-  (decided 2026-11-19). Whether the wiki itself lives in git or in a writable collection
-  is the wiki's decision; the link table works for both.
+- The core models only metadata, aliases and links; everything domain-specific is a
+  profile, managed like lexicons (decided 2026-11-19, replacing a draft with persons,
+  identifiers and references as tables).
+- Person identities and affiliations are not modelled; authors are a filterable
+  metadata field. Disambiguation belongs to the knowledge layer.
+- Markdown stays the source of truth for pages; page links are derived on every write
+  and checked there per collection, instead of by a lint pass. Whether the wiki itself
+  lives in git or in a writable collection is the wiki's decision.
 - What is stored about a link is the same for everyone; its status is computed per
-  reader, and a hidden target is indistinguishable from one the service does not hold
-  (decided 2026-11-19).
-- One service instance. Other catalogues and services are external identifiers with
-  optional URL templates; there is no resolution across services.
-- No graph database: PostgreSQL tables with recursive queries at this scale.
-- Extraction and resolution against external catalogues happen upstream; the server
-  only resolves against identifiers it already holds and extracts page links itself.
+  reader, and a hidden target is indistinguishable from one the service does not hold.
+- One service instance; other catalogues and services are external references with
+  optional URL templates. No graph database at this scale.
+
+## Appendix A. Scientific profile and the DELPHI mapping
+
+### A.1 What the DELPHI corpus provides
+
+Measured on 2026-11-19:
+
+- Frontmatter: `authors`, `author_count`, `collaborations`, `report_numbers`, `doi`,
+  `arxiv`, `inspire`, `cds`, `conferences`, `year`, `category`, `kind`, `languages`,
+  `keywords`.
+- `md/authors.jsonl`: per document an ordered author list (name, affiliations, some
+  INSPIRE, ORCID and ROR ids) and, for theses, supervisors. 183,214 author entries; 351
+  documents have more than 100 authors (up to 2,446).
+- Per-document cards: `topics`, `detectors`, `data_years`.
+- References exist only as bibliography sections in the Markdown, clean for born-digital
+  documents and noisy for scans. Nothing is extracted yet.
+- The source documents contain no wikilinks; the wiki pages built from them upstream do.
+
+### A.2 The `scientific` profile
+
+```
+{
+  "fields": {
+    "year":           {"type": "int"},
+    "kind":           {"type": "keyword"},
+    "category":       {"type": "keyword"},
+    "languages":      {"type": "keyword[]"},
+    "authors":        {"type": "person[]"},
+    "supervisors":    {"type": "person[]"},
+    "collaborations": {"type": "keyword[]"},
+    "keywords":       {"type": "keyword[]"},
+    "topics":         {"type": "keyword[]", "from": "card.topics"},
+    "detectors":      {"type": "keyword[]", "from": "card.detectors"},
+    "data_years":     {"type": "keyword[]", "from": "card.data_years"},
+    "title":          {"type": "text"}
+  },
+  "aliases": {
+    "doi":     {"from": "doi",            "normalise": ["trim", "lower", "strip_prefix:https://doi.org/"]},
+    "arxiv":   {"from": "arxiv",          "normalise": ["trim", "lower", "strip_prefix:arxiv:", "replace:v[0-9]+$:"]},
+    "report":  {"from": "report_numbers", "normalise": ["trim", "upper", "collapse_space"]},
+    "inspire": {"from": "inspire"},
+    "cds":     {"from": "cds"}
+  },
+  "link_kinds": ["cites", "erratum_of", "supersedes", "see_also"],
+  "url_templates": {
+    "doi": "https://doi.org/{value}",
+    "arxiv": "https://arxiv.org/abs/{value}",
+    "inspire": "https://inspirehep.net/literature/{value}"
+  }
+}
+```
+
+A filter `authors: "Hamacher"` with `authors: {"max_len": 100}` finds a member's own
+notes without every collaboration paper.
+
+### A.3 DELPHI ingest mapping
+
+- The ingest CLI merges `authors.jsonl` (names in order, supervisors) and the card into
+  the metadata it posts. Affiliations and person ids are kept in the metadata as
+  delivered but are not declared fields.
+- References: once delphi-knowledge-base extracts reference lists (from INSPIRE or the
+  bibliography sections), the ingest CLI posts them as `payload` links of kind `cites`,
+  with the cited identifier as `scheme:value` when known and the raw text always.

@@ -134,7 +134,7 @@ model endpoint. CERN-specific facts live in `docs/cern-infrastructure.md`.
   from the request over HTTP; stdio is a client of the HTTP service). Supports finding
   and agentic reading: `list_collections`, `search`, `list_documents`, `outline`,
   `get_document` (bounded line, section or page ranges with a `next` selector),
-  `get_chunk` (with neighbours), `get_links`, `linked_from`, `find_person`, and
+  `get_chunk` (with neighbours), `get_links`, `linked_from`, and
   documents as resources. Page links in Markdown are extracted on every write and can be
   checked per collection. Where the principal and
   token have `write`, also `put_document`, `patch_section` and `delete_document`, with a
@@ -201,8 +201,8 @@ model endpoint. CERN-specific facts live in `docs/cern-infrastructure.md`.
 - `docs/spec.md` — the design spec. Sections 1 (collections and access control),
   2 (lexical normaliser), 3 (indexes), 4 (MCP server), 5 (document elements, a
   placeholder for figures, tables and equations), 6 (lexical backends, including
-  BM25 in SQL) and 7 (bibliographic data and links: authors, identifiers, references
-  and page links) are written; the other sections come
+  BM25 in SQL) and 7 (metadata, aliases and links, with domain specifics in profiles;
+  appendix A is the scientific profile) are written; the other sections come
   before their components.
 - `docs/cern-infrastructure.md` — verified facts about DBOD, the AI gateway and
   ml.cern.ch, with dates. Update it when re-checked.
@@ -239,5 +239,5 @@ Verified facts go to `docs/cern-infrastructure.md`; decisions go to `docs/spec.m
   format (its backlog plans `page_break_placeholder`), or implement the Docling JSON
   fallback in the ingest.
 - **References.** Ask the delphi-knowledge-base repository to extract reference lists
-  (from INSPIRE or the bibliography sections) and resolve them to identifiers, for the
-  ingest payload of `docs/spec.md` section 7.4.
+  (from INSPIRE or the bibliography sections) and resolve them to identifiers, posted
+  as payload links (`docs/spec.md` section 7.5, appendix A.3).
