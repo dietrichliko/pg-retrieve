@@ -889,6 +889,12 @@ Two things are modelled:
   queries (outgoing, incoming, chains), the access rule and provenance; they differ in
   origin and in whether they are checked (7.5).
 
+One service holds many collections with different audiences (section 1): public papers,
+internal notes, wiki pages, possibly of several experiments. A link can therefore point
+to a document the reader can read, to one the service holds but hides from that reader,
+or to something outside the service. What is stored about a link is the same for
+everyone; what a reader sees is computed per reader (7.6).
+
 Everything here is optional. A corpus without bibliographic data or links leaves the
 tables empty and loses nothing else.
 
@@ -922,17 +928,24 @@ persons(id, display_name, name_key, orcid NULL, inspire_id NULL)
 document_persons(doc_id, person_id, role, position, affiliations text[],
                  name_as_written)                    -- role: author, supervisor, editor
 links(id, doc_id, kind, position, lines, pages,
-      target_doc_id NULL, target_section NULL,       -- resolved target in the service
-      target_scheme NULL, target_value NULL,         -- external identifier
+      target_scheme NULL, target_value NULL,         -- identifier as cited
       text NULL,                                     -- reference text or link label
-      status, origin, created_at)
+      origin, created_at)
+link_targets(link_id, target_doc_id, target_section NULL, matched_by)
+                                                     -- every document in the service
+                                                     --   the link matches
 ```
 
 - **Kinds.** Reference kinds: `cites`, `erratum_of`, `supersedes`, `see_also`, extendable.
   Page link kind: `links_to`. The kind decides origin and checking (7.5).
-- **Status.** `resolved` (target document in the service), `external` (an identifier
-  outside the service), `unresolved` (nothing matched). `origin` records who produced the
-  edge: `ingest` (payload), `server` (extracted from Markdown or re-resolved).
+- **What is stored** is independent of who reads it: the identifier as cited, the text,
+  and in `link_targets` every document of the service the link matches, in any
+  collection. One identifier can match several documents, for example a public paper and
+  an internal draft of it in another collection. `matched_by` records how (`id`,
+  `doi`, `report`, ...). `origin` records who produced the edge: `ingest` (payload) or
+  `server` (extracted from Markdown).
+- **No stored status.** Whether a link is resolved depends on the reader and is computed
+  when it is read (7.6).
 - **Identifiers** are normalised on ingest (lowercase DOI, arXiv without version, report
   numbers with collapsed whitespace) so references can be matched against them.
 - **Persons.** `name_key` is a normalised form (surname plus initials, accents folded).
@@ -955,9 +968,9 @@ links(id, doc_id, kind, position, lines, pages,
   parsing bibliography sections) and posted with the document. pg-retrieve never calls an
   external bibliographic service itself: the only outbound destination is the configured
   model endpoint.
-- After each ingest the server re-resolves `unresolved` and `external` references against
-  all identifiers in the service, so a reference to a document ingested later resolves
-  without re-posting.
+- After each ingest, write or delete the server updates `link_targets` for links whose
+  identifiers match the added or removed document, in every collection, so a reference
+  to a document ingested later resolves without re-posting.
 - References are never checked or rejected: they are facts about a source document,
   including its mistakes.
 
@@ -979,28 +992,54 @@ ingest and on every write (section 4.5). Recognised forms:
 - A section target is checked against the target's outline (number or heading path).
 - Links inside code blocks and inline code are ignored. Ordinary web URLs are not edges.
 - **Checking** is a per-collection setting, `links.unresolved`:
-  - `flag` (default): the write succeeds, the link is stored as `unresolved`, and the
-    response lists it.
+  - `flag` (default): the write succeeds, the link is stored without targets, and the
+    response lists it as unresolved.
   - `reject`: a write with an unresolved `links_to` edge fails with the list of broken
     links. Nothing is stored.
   With `reject` no broken link can enter the collection, which replaces a lint pass.
-- **Deleting a linked document.** `delete_document` reports readable incoming
-  `links_to` edges. In a `reject` collection it refuses while any exist unless `force`
-  is given; forced or not, the edges become `unresolved` and stay visible to the linking
-  pages' writers.
+- **Narrowing links.** When a writer links to a document whose collection is readable by
+  fewer principals than the page's own collection, the write succeeds and the response
+  warns that some readers of the page will see only the identifier. The comparison is
+  made on grants (principals, groups and patterns with `read`), so it is approximate when
+  group membership comes from an external provider. It is never an error: linking an
+  internal note from a wider page is the writer's decision.
+- **Deleting a linked document.** `delete_document` reports the incoming `links_to` edges
+  from documents the deleting principal can read. In a `reject` collection it refuses
+  while any exist unless `force` is given; forced or not, those links lose the target.
 - Changing `links.unresolved` to `reject` does not touch existing pages; the response of
   the settings change lists the collection's unresolved links.
 
-### 7.6 Access
+### 7.6 Access and what a reader sees
 
-- A person, identifier or link is visible only through a document the principal can
-  read. Author queries return only readable documents.
-- A link whose target document is in a collection the principal cannot read is shown as
-  unresolved, with its text and external identifier: the edge does not reveal that the
-  hidden document exists. For checking (7.5) the writer's own rights apply: a link to a
-  document the writer cannot read counts as unresolved.
+The status of a link is computed for each reader from the stored targets:
+
+| Stored situation | Reader sees |
+|---|---|
+| at least one target in a collection the reader can read | `resolved`: the preferred readable target's id, title, year and section |
+| targets exist, none readable by this reader | `external`: the identifier as cited and the text |
+| no target in the service, identifier present | `external`: the identifier as cited and the text |
+| no target, no identifier | `unresolved`: the text only |
+
+- A hidden target and a document the service does not hold look exactly alike, in the
+  status and the fields, and are answered by the same query, so readers cannot probe
+  which hidden documents exist. The identifier itself is not secret: it is
+  printed in the citing document, which the reader can read.
+- Among several readable targets the preferred one is in the citing document's own
+  collection, then in a collection sharing its prefix, then the most recent. The others
+  are listed as `also` so a reader can choose.
+- Incoming links, counts in `outline`, and any later ranking use only links whose
+  citing document the reader can read. Counting all of them would reveal hidden citing
+  documents.
+- Persons and identifiers are visible only through readable documents. Author queries
+  return only readable documents.
+- Checking on write (7.5) uses the writer's own rights: a link whose only targets the
+  writer cannot read counts as unresolved for them.
 - Writing bibliographic data needs `write` on the document's collection, as for the
   document itself. Changing `links.unresolved` needs `admin`.
+- External identifiers can carry a URL for clients, from per-scheme templates in config
+  (`links.url_templates`, for example `doi: https://doi.org/{value}`,
+  `arxiv: https://arxiv.org/abs/{value}`). The server builds the string and never fetches
+  it.
 
 ### 7.7 Search and MCP
 
@@ -1014,11 +1053,12 @@ ingest and on every write (section 4.5). Recognised forms:
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `get_links` | `doc_id`, `kind` (optional, list), `status` (optional), `limit`, `cursor` | the document's outgoing links in order: kind, text, lines and pages, the resolved document (id, title, year, section) when readable, otherwise the external identifier |
+| `get_links` | `doc_id`, `kind` (optional, list), `status` (optional), `limit`, `cursor` | the document's outgoing links in order: kind, text, lines and pages, the status for this reader (7.6), the preferred readable target and `also`, or the identifier with its URL |
 | `linked_from` | `doc_id`, `kind` (optional, list), `limit`, `cursor` | readable documents with links to it (citing papers, wiki pages), each with the kind and the linking lines and pages |
 | `find_person` | `name` or `orcid` | matching persons with their readable document count and years |
 
-  The write tools (4.5) return the extracted links and any unresolved ones.
+  The write tools (4.5) return the extracted links, the unresolved ones and any
+  narrowing warnings.
   The server instructions add: follow references and page links with `get_links` and
   `linked_from` rather than searching for titles; treat external and unresolved
   references as leads outside the corpus; in a `reject` collection, fix or remove broken
@@ -1038,6 +1078,11 @@ ingest and on every write (section 4.5). Recognised forms:
   every write and checked there, per collection, instead of by a separate lint pass
   (decided 2026-11-19). Whether the wiki itself lives in git or in a writable collection
   is the wiki's decision; the link table works for both.
+- What is stored about a link is the same for everyone; its status is computed per
+  reader, and a hidden target is indistinguishable from one the service does not hold
+  (decided 2026-11-19).
+- One service instance. Other catalogues and services are external identifiers with
+  optional URL templates; there is no resolution across services.
 - No graph database: PostgreSQL tables with recursive queries at this scale.
 - Extraction and resolution against external catalogues happen upstream; the server
   only resolves against identifiers it already holds and extracts page links itself.
